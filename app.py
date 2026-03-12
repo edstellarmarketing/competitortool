@@ -1,33 +1,55 @@
 import streamlit as st
-import requests
-import trafilatura
-from trafilatura.settings import use_config
-from bs4 import BeautifulSoup, Comment, NavigableString
-from io import BytesIO
-from urllib.parse import urlparse
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import subprocess
+import sys
+import os
 import re
 import time
+import base64
+import json
+import tempfile
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import urlparse
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.drawing.image import Image as XlImage
+from PIL import Image as PILImage
+
+# ───────────────────────────────────────────────
+# Install Playwright browsers on first run
+# ───────────────────────────────────────────────
+@st.cache_resource
+def install_playwright():
+    """Install Chromium browser for Playwright (runs once per deployment)."""
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+        capture_output=True,
+    )
+    return True
 
 # ───────────────────────────────────────────────
 # Page Config
 # ───────────────────────────────────────────────
-st.set_page_config(page_title="L&D Page Body Extractor", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="L&D Page Extractor", page_icon="🔍", layout="wide")
 
 st.markdown("""
 <style>
     .stApp { background-color: #f8f9fb; }
     h1 { font-size: 1.8rem !important; font-weight: 700; color: #1a1a2e; }
-    .block-container { padding-top: 2rem; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🔍 L&D Competitor Page Body Extractor")
-st.caption("Paste competitor URLs → Extract main body content (no header/nav/footer) → Export to Excel")
+st.title("🔍 L&D Competitor Page Extractor")
+st.caption(
+    "Uses a real browser (Playwright/Chromium) to load each page, "
+    "take a full-page screenshot, then extract only the main body content — "
+    "ignoring top menus, sidebars, and footers."
+)
 
 # ───────────────────────────────────────────────
-# Default URLs
+# Defaults
 # ───────────────────────────────────────────────
 DEFAULT_URLS = """https://cmoe.com/products-and-services/learning-and-development-advisory-services/
 https://www.ey.com/en_gl/services/workforce/learning-development-advisory
@@ -40,169 +62,184 @@ https://www.thinkdom.co/learning-and-development-consulting
 https://www.wipro.com/consulting/learning-and-development-consulting-services/
 https://services.elblearning.com/learning-and-development-consulting"""
 
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-# Trafilatura config: be generous with content extraction
-TRAF_CONFIG = use_config()
-TRAF_CONFIG.set("DEFAULT", "MIN_OUTPUT_SIZE", "100")
-TRAF_CONFIG.set("DEFAULT", "MIN_EXTRACTED_SIZE", "100")
-
 
 # ───────────────────────────────────────────────
-# Extraction Methods
+# JS injection script — runs inside the browser
+# to extract main body content and remove noise
 # ───────────────────────────────────────────────
+EXTRACT_JS = """
+() => {
+    // Remove noise elements from the live DOM
+    const noiseSelectors = [
+        'header', 'nav', 'footer',
+        '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+        '.cookie-banner', '.cookie-consent', '#onetrust-banner-sdk',
+        '.site-header', '.site-footer', '.site-nav',
+        '.mega-menu', '.mobile-menu', '.breadcrumb', '.breadcrumbs',
+        '.social-share', '.share-buttons',
+        '.sidebar', 'aside',
+        'script', 'style', 'noscript', 'iframe',
+        'svg', 'img', 'picture', 'video', 'canvas',
+    ];
 
-def fetch_html(url, timeout_sec):
-    """Fetch raw HTML from a URL with browser-like headers."""
-    session = requests.Session()
-    session.headers.update(REQUEST_HEADERS)
-    resp = session.get(url, timeout=timeout_sec, allow_redirects=True)
-    resp.raise_for_status()
-    return resp.text, resp.status_code
+    // Also match by class/id patterns
+    const noisePatterns = /nav|header|footer|menu|sidebar|cookie|consent|banner|popup|modal|breadcrumb|social|share|skip|onetrust|grecaptcha/i;
 
+    // First pass: remove by selector
+    noiseSelectors.forEach(sel => {
+        document.querySelectorAll(sel).forEach(el => el.remove());
+    });
 
-def extract_with_trafilatura(html, output_fmt="txt"):
-    """
-    Primary extraction: trafilatura.
-    Handles boilerplate removal (nav, footer, sidebar, ads) automatically.
-    Returns clean text or XML/HTML.
-    """
-    result = trafilatura.extract(
-        html,
-        include_comments=False,
-        include_tables=True,
-        include_links=True,
-        include_images=False,
-        include_formatting=True,
-        favor_recall=True,       # extract more content rather than less
-        output_format=output_fmt,
-        config=TRAF_CONFIG,
-    )
-    return result
+    // Second pass: remove by class/id pattern
+    document.querySelectorAll('*').forEach(el => {
+        const cls = el.className && typeof el.className === 'string' ? el.className : '';
+        const id = el.id || '';
+        const role = el.getAttribute('role') || '';
+        if (noisePatterns.test(cls) || noisePatterns.test(id) ||
+            ['navigation', 'banner', 'contentinfo'].includes(role.toLowerCase())) {
+            el.remove();
+        }
+    });
 
+    // Find main content container
+    const main = document.querySelector('main')
+        || document.querySelector('article')
+        || document.querySelector('[role="main"]')
+        || document.querySelector('#content, #main-content, .main-content, .page-content, .entry-content')
+        || document.querySelector('.content, .page-body')
+        || document.body;
 
-def extract_with_beautifulsoup(html):
-    """
-    Fallback extraction: BeautifulSoup.
-    Strips known non-content elements and returns remaining text.
-    """
-    soup = BeautifulSoup(html, "html.parser")
+    // Get clean text with structure preserved
+    function extractText(node, depth = 0) {
+        let result = '';
+        for (const child of node.childNodes) {
+            if (child.nodeType === 3) { // text node
+                const text = child.textContent.trim();
+                if (text) result += text + ' ';
+            } else if (child.nodeType === 1) { // element node
+                const tag = child.tagName.toLowerCase();
+                const blockTags = ['div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                                   'li', 'tr', 'section', 'article', 'blockquote', 'figcaption'];
+                const isBlock = blockTags.includes(tag);
 
-    # Remove comments
-    for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
-        c.extract()
+                if (isBlock) result += '\\n';
 
-    # Remove non-content tags
-    for tag_name in ["script", "style", "header", "nav", "footer",
-                     "noscript", "iframe", "svg", "img", "picture"]:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
+                // Add heading markers
+                if (['h1','h2','h3','h4','h5','h6'].includes(tag)) {
+                    const level = tag[1];
+                    result += '\\n' + '#'.repeat(parseInt(level)) + ' ';
+                }
 
-    # Remove elements with nav/footer/menu/cookie classes or ids
-    noise_re = re.compile(
-        r"nav|header|footer|menu|sidebar|cookie|consent|banner|popup|modal|"
-        r"breadcrumb|skip|onetrust|social-share|mega-menu|site-footer|site-header",
-        re.IGNORECASE
-    )
-    to_remove = []
-    for tag in soup.find_all(True):
-        if isinstance(tag, NavigableString) or not hasattr(tag, "get"):
-            continue
-        classes = tag.get("class", [])
-        class_str = " ".join(classes) if isinstance(classes, list) else str(classes or "")
-        tag_id = str(tag.get("id", "") or "")
-        role = str(tag.get("role", "") or "").lower()
-        if noise_re.search(class_str) or noise_re.search(tag_id) or role in ("navigation", "banner", "contentinfo"):
-            to_remove.append(tag)
-    for tag in to_remove:
-        try:
-            tag.decompose()
-        except Exception:
-            pass
+                // Add list markers
+                if (tag === 'li') {
+                    result += '• ';
+                }
 
-    # Find main content container
-    main = (
-        soup.find("main")
-        or soup.find("article")
-        or soup.find("div", attrs={"role": "main"})
-        or soup.find("div", id=re.compile(r"content|main", re.I))
-        or soup.find("div", class_=re.compile(r"content|main|page-body|entry", re.I))
-        or soup.find("body")
-        or soup
-    )
+                result += extractText(child, depth + 1);
 
-    text = main.get_text(separator="\n", strip=True)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def extract_page_content(url, timeout_sec, output_mode):
-    """
-    Master extraction function.
-    Strategy:
-      1. Fetch raw HTML
-      2. Try trafilatura (purpose-built for main content extraction)
-      3. If trafilatura returns empty/too short, fallback to BeautifulSoup
-    """
-    try:
-        html, status_code = fetch_html(url, timeout_sec)
-    except requests.exceptions.Timeout:
-        return {"url": url, "status": "error", "content": f"⏱ Timeout after {timeout_sec}s", "method": "none"}
-    except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        return {"url": url, "status": "error", "content": f"HTTP {code} error", "method": "none"}
-    except Exception as e:
-        return {"url": url, "status": "error", "content": f"Fetch error: {str(e)[:200]}", "method": "none"}
-
-    # Attempt 1: trafilatura
-    fmt = "txt" if output_mode == "Plain Text" else "txt"
-    content = extract_with_trafilatura(html, fmt)
-
-    method = "trafilatura"
-
-    # If trafilatura fails or returns too little, fallback
-    if not content or len(content.strip()) < 150:
-        content = extract_with_beautifulsoup(html)
-        method = "beautifulsoup"
-
-    # Final safety check
-    if not content or len(content.strip()) < 50:
-        content = f"[Extraction returned minimal content. Raw HTML was {len(html):,} chars. The site may require JavaScript rendering.]"
-        method = "failed"
-
-    return {
-        "url": url,
-        "status": "success" if method != "failed" else "warning",
-        "content": content.strip(),
-        "method": method,
+                if (isBlock) result += '\\n';
+            }
+        }
+        return result;
     }
+
+    const text = extractText(main);
+    // Clean up excessive whitespace
+    return text.replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();
+}
+"""
+
+
+# ───────────────────────────────────────────────
+# Core extraction with Playwright
+# ───────────────────────────────────────────────
+def extract_page(url, timeout_ms, screenshot_dir):
+    """
+    Load URL in headless Chromium, take screenshot, extract body content.
+    Returns dict with screenshot_path, content, status.
+    """
+    from playwright.sync_api import sync_playwright
+
+    domain = get_domain(url)
+    screenshot_path = os.path.join(screenshot_dir, f"{domain}.png")
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+
+            # Navigate and wait for content to load
+            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+
+            # Extra wait for lazy-loaded content
+            page.wait_for_timeout(2000)
+
+            # Scroll down to trigger lazy loading, then scroll back up
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1000)
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(500)
+
+            # Take full-page screenshot BEFORE removing elements
+            page.screenshot(path=screenshot_path, full_page=True, type="png")
+
+            # Now extract content by running JS in the page context
+            content = page.evaluate(EXTRACT_JS)
+
+            browser.close()
+
+            if not content or len(content.strip()) < 100:
+                return {
+                    "url": url,
+                    "status": "warning",
+                    "content": content or "[Minimal content extracted]",
+                    "screenshot": screenshot_path if os.path.exists(screenshot_path) else None,
+                    "method": "playwright-minimal",
+                }
+
+            return {
+                "url": url,
+                "status": "success",
+                "content": content.strip(),
+                "screenshot": screenshot_path,
+                "method": "playwright",
+            }
+
+    except Exception as e:
+        return {
+            "url": url,
+            "status": "error",
+            "content": f"Error: {str(e)[:300]}",
+            "screenshot": screenshot_path if os.path.exists(screenshot_path) else None,
+            "method": "failed",
+        }
 
 
 # ───────────────────────────────────────────────
 # Helpers
 # ───────────────────────────────────────────────
-
 def get_domain(url):
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.replace("www.", "").replace("services.", "")
-        return domain.split(".")[0].capitalize()
+        return re.sub(r"[^a-zA-Z0-9]", "_", domain.split(".")[0].capitalize())
     except Exception:
-        return url
+        return "unknown"
 
 
-def build_excel(results):
+def build_excel(results, include_screenshots=True):
+    """Build Excel with S.No, Company, URL, Method, Body Content, and optionally embedded screenshots."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Page Body Content"
@@ -219,8 +256,12 @@ def build_excel(results):
         bottom=Side(style="thin", color="CCCCCC"),
     )
 
-    headers = ["S.No", "Company", "URL", "Extraction Method", "Body Content"]
-    widths = {"A": 6, "B": 18, "C": 52, "D": 16, "E": 160}
+    if include_screenshots:
+        headers = ["S.No", "Company", "URL", "Method", "Screenshot", "Body Content"]
+        widths = {"A": 6, "B": 18, "C": 50, "D": 14, "E": 40, "F": 140}
+    else:
+        headers = ["S.No", "Company", "URL", "Method", "Body Content"]
+        widths = {"A": 6, "B": 18, "C": 50, "D": 14, "E": 160}
 
     for i, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=i, value=h)
@@ -239,15 +280,34 @@ def build_excel(results):
         row = idx + 1
         domain = get_domain(r["url"])
         content = r["content"][:32000] if r["content"] else ""
-        method = r.get("method", "unknown")
+        method = r.get("method", "?")
 
-        for col, val in enumerate([idx, domain, r["url"], method, content], 1):
+        if include_screenshots:
+            values = [idx, domain, r["url"], method, "", content]
+        else:
+            values = [idx, domain, r["url"], method, content]
+
+        for col, val in enumerate(values, 1):
             c = ws.cell(row=row, column=col, value=val)
             c.font = body_font
             c.alignment = wrap
             c.border = border
 
-        ws.row_dimensions[row].height = 400
+        # Embed screenshot thumbnail
+        if include_screenshots and r.get("screenshot") and os.path.exists(r["screenshot"]):
+            try:
+                img = PILImage.open(r["screenshot"])
+                # Resize to thumbnail for Excel (max 300px wide)
+                img.thumbnail((300, 600), PILImage.LANCZOS)
+                thumb_path = r["screenshot"].replace(".png", "_thumb.png")
+                img.save(thumb_path)
+                xl_img = XlImage(thumb_path)
+                ws.add_image(xl_img, f"E{row}")
+                ws.row_dimensions[row].height = max(300, int(img.height * 0.75))
+            except Exception:
+                ws.row_dimensions[row].height = 400
+        else:
+            ws.row_dimensions[row].height = 400
 
     buf = BytesIO()
     wb.save(buf)
@@ -260,24 +320,29 @@ def build_excel(results):
 # ───────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
-    timeout = st.slider("Request timeout (sec)", 5, 30, 15)
-    output_mode = st.radio("Output format", ["Plain Text", "HTML body"])
+    timeout_sec = st.slider("Page load timeout (sec)", 10, 60, 30)
+    include_screenshots = st.checkbox("Include screenshots in Excel", value=True)
     st.markdown("---")
     st.subheader("How it works")
     st.markdown(
-        "**Step 1:** Fetches each URL with browser-like headers\n\n"
-        "**Step 2:** Extracts body content using **trafilatura** — "
-        "a purpose-built library that automatically removes nav, header, "
-        "footer, sidebars, ads, and boilerplate\n\n"
-        "**Step 3:** If trafilatura returns too little, falls back to "
-        "**BeautifulSoup** with pattern-based noise removal\n\n"
-        "**Step 4:** Exports everything to a clean Excel file"
+        "**1.** Launches a real **Chromium browser** (headless) via Playwright\n\n"
+        "**2.** Loads each URL, waits for JS to render, scrolls to trigger lazy loading\n\n"
+        "**3.** Takes a **full-page screenshot** before any DOM manipulation\n\n"
+        "**4.** Runs a JS script inside the page to **remove** nav, header, footer, "
+        "sidebar, cookie banners, and noise elements\n\n"
+        "**5.** Extracts the remaining **main content** with heading/list structure preserved\n\n"
+        "**6.** Exports to Excel with screenshots + clean text"
     )
 
 
 # ───────────────────────────────────────────────
 # Main UI
 # ───────────────────────────────────────────────
+
+# Install Playwright on first run
+with st.spinner("🔧 Setting up browser engine (first run only)..."):
+    install_playwright()
+
 urls_input = st.text_area("📋 Paste URLs (one per line):", value=DEFAULT_URLS, height=260)
 
 col1, col2, _ = st.columns([1, 1, 3])
@@ -293,18 +358,21 @@ if run_btn:
     if not urls:
         st.error("Please enter at least one URL.")
     else:
+        # Create temp dir for screenshots
+        screenshot_dir = tempfile.mkdtemp(prefix="ld_screenshots_")
         results = []
-        progress = st.progress(0, text="Starting extraction...")
+        timeout_ms = timeout_sec * 1000
+        progress = st.progress(0, text="Starting browser...")
 
         for i, url in enumerate(urls):
             domain = get_domain(url)
-            progress.progress(i / len(urls), text=f"Fetching {i+1}/{len(urls)}: {domain}...")
-            result = extract_page_content(url, timeout, output_mode)
+            progress.progress(i / len(urls), text=f"🌐 Loading {i+1}/{len(urls)}: {domain}...")
+            result = extract_page(url, timeout_ms, screenshot_dir)
             results.append(result)
-            time.sleep(0.5)
 
         progress.progress(1.0, text="✅ All done!")
         st.session_state["results"] = results
+        st.session_state["screenshot_dir"] = screenshot_dir
 
 
 # ───────────────────────────────────────────────
@@ -324,11 +392,12 @@ if "results" in st.session_state:
     c3.metric("⚠️ Partial", warnings)
     c4.metric("❌ Failed", errors)
 
-    excel_buf = build_excel(results)
+    # Excel download
+    excel_buf = build_excel(results, include_screenshots)
     st.download_button(
-        label="📥 Download Excel",
+        label="📥 Download Excel (with screenshots)",
         data=excel_buf,
-        file_name="LD_Competitor_Body_Content.xlsx",
+        file_name="LD_Competitor_Content_Screenshots.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
@@ -352,10 +421,25 @@ if "results" in st.session_state:
 
         with st.expander(label, expanded=False):
             st.caption(r["url"])
-            if r["status"] == "error":
-                st.error(r["content"])
+
+            # Show screenshot if available
+            if r.get("screenshot") and os.path.exists(r["screenshot"]):
+                col_img, col_txt = st.columns([1, 2])
+                with col_img:
+                    st.image(r["screenshot"], caption="Page Screenshot", use_container_width=True)
+                with col_txt:
+                    if r["status"] == "error":
+                        st.error(r["content"])
+                    else:
+                        preview = r["content"][:5000]
+                        if content_len > 5000:
+                            preview += "\n\n... [truncated — full content in Excel]"
+                        st.text(preview)
             else:
-                preview = r["content"][:8000]
-                if content_len > 8000:
-                    preview += "\n\n... [truncated — full content in Excel download]"
-                st.text(preview)
+                if r["status"] == "error":
+                    st.error(r["content"])
+                else:
+                    preview = r["content"][:5000]
+                    if content_len > 5000:
+                        preview += "\n\n... [truncated — full content in Excel]"
+                    st.text(preview)
